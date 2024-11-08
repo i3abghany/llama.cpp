@@ -2641,6 +2641,8 @@ struct llama_layer {
 
     // normalization
     struct ggml_tensor * ffn_norm;
+    struct ggml_tensor * ffn_norm2;
+    struct ggml_tensor * ffn_norm3;
     struct ggml_tensor * ffn_norm_b;
     struct ggml_tensor * ffn_post_norm;
     struct ggml_tensor * layer_out_norm;
@@ -2733,6 +2735,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_scale;
     struct ggml_tensor * ffn_down_scale;
 };
+
 
 // very similar to llama_batch,
 // but has more metadata about sequences
@@ -2918,6 +2921,49 @@ struct llama_model {
         }
     }
 };
+
+int llama_model_get_n_layer(const llama_model * model) {
+    return model->layers.size();
+}
+
+void check_integrity_ffn_norm(llama_model *model) {
+    auto n_layers = llama_model_get_n_layer(model);
+    for (int il = 0; il < n_layers; il++) {
+        llama_layer &layer = model->layers[il];
+        if (layer.ffn_norm == nullptr)
+            continue;
+
+        auto size = 1;
+        for (int i = 0; i < 4; i++) {
+            size *= layer.ffn_norm->ne[i];
+        }
+
+        for (int i = 0; i < size / 4; i++) {
+            auto d1 = ((uint32_t*)layer.ffn_norm->data)[i];
+            auto d2 = ((uint32_t*)layer.ffn_norm2->data)[i];
+            auto d3 = ((uint32_t*)layer.ffn_norm3->data)[i];
+
+            bool good = d1 == d2 && d2 == d3 && d1 == d3;
+            if (!good) {
+                LLAMA_LOG_ERROR("FFN norm mismatch at layer %d, index %d: %u %u %u", il, i, d1, d2, d3);
+            }
+        }
+    }
+}
+
+void harden_ffn_norm(llama_model *model, uint32_t il) {
+    llama_layer &layer = model->layers[il];
+
+    if (layer.ffn_norm == nullptr) return;
+
+    char *p = (char*) malloc(layer.ffn_norm->ne[0] * 4);
+    memcpy(p, layer.ffn_norm->data, layer.ffn_norm->ne[0] * 4);
+    layer.ffn_norm2->data = p;
+
+    p = (char*) malloc(layer.ffn_norm->ne[0] * 4);
+    memcpy(p, layer.ffn_norm->data, layer.ffn_norm->ne[0] * 4);
+    layer.ffn_norm3->data = p;
+}
 
 struct llama_sbatch_seq {
     int32_t n_seq_id;
@@ -7521,6 +7567,8 @@ static bool llm_load_tensors(
                         layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd},     llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_norm2 = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_norm3 = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
                         layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_rot/2}, llama_model_loader::TENSOR_NOT_REQUIRED | (i != 0 ? llama_model_loader::TENSOR_DUPLICATED : 0));
 
@@ -8185,6 +8233,8 @@ static bool llm_load_tensors(
                         layer.bo   = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i),   {n_embd}, 0);
 
                         layer.ffn_norm   = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_norm2   = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_norm3   = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
                         layer.ffn_norm_b = create_tensor(tn(LLM_TENSOR_FFN_NORM, "bias", i),   {n_embd}, 0);
 
                         layer.ffn_down   = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
@@ -8320,6 +8370,8 @@ static bool llm_load_tensors(
                         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_norm2 = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_norm3 = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
                         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
@@ -9036,7 +9088,8 @@ static bool llm_load_tensors(
         }
     }
 
-    ml.done_getting_tensors();
+    // TODO: make it aware of copies
+    // ml.done_getting_tensors();
 
     ml.init_mappings(true, use_mlock ? &model.mlock_mmaps : nullptr);
     model.mappings.reserve(ml.mappings.size());
@@ -21959,7 +22012,7 @@ void llama_perf_context_print(const struct llama_context * ctx) {
     LLAMA_LOG_INFO("%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
     LLAMA_LOG_INFO("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
-    LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
+    LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.4f ms per token, %8.2f tokens per second)\n",
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
 }

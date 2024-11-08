@@ -6,6 +6,7 @@
 #include "llama.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -542,7 +543,16 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+    void harden_ffn_norm(llama_model *, uint32_t);
+    int llama_model_get_n_layer(const llama_model *);
+
+    for (int i = 0; i < llama_model_get_n_layer(model); i++)
+        harden_ffn_norm(model, i);
+
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
+        void check_integrity_ffn_norm(llama_model *model);
+        check_integrity_ffn_norm(model);
+
         // predict
         if (!embd.empty()) {
             // Note: (n_ctx - 4) here is to match the logic for commandline prompt handling via
